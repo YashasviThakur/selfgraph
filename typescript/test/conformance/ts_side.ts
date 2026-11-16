@@ -1205,6 +1205,39 @@ export const SUPERSEDE_SCHEMA: Schema = {
 };
 
 /**
+ * Unmerge a merge with no source while another merge with a source shares the survivor's relation.
+ *
+ * @param graph (SelfGraph): a graph with the default resolver.
+ * @return (Promise<Record<string, unknown>>): each restored relation's source count and evidence sources.
+ */
+export async function unmerge(graph: SelfGraph): Promise<Record<string, unknown>> {
+  const knows = (from: string) => ({ from_entity: from, type: "KNOWS", to_entity: "person:xena" });
+  await graph.insert.facts({
+    entities: [
+      { type: "Person", name: "Robert", aliases: ["Bob", "Bobby"] },
+      { type: "Person", name: "Xena" },
+    ],
+  });
+  const first = await graph.insert.facts({
+    entities: [{ type: "Person", name: "Bob" }],
+    relations: [knows("person:bob")],
+  });
+  await graph.insert.facts(
+    { entities: [{ type: "Person", name: "Bobby" }], relations: [knows("person:bobby")] },
+    { source_id: "s2" },
+  );
+  await graph.entities.unmerge(first.merges[0]!.id);
+  const out: Record<string, unknown> = {};
+  for (const from of ["person:bob", "person:robert"]) {
+    const rid = ids.relationId(from, "KNOWS", "person:xena");
+    const rel = await graph.relations.get(rid);
+    const evidence = await graph.relations.evidence(rid);
+    out[from] = { source_count: rel?.source_count ?? null, sources: evidence.items.map((e) => e.source_id).sort() };
+  }
+  return out;
+}
+
+/**
  * Supersede relations capped at both endpoints, with facts arriving out of order across batches.
  *
  * @param graph (SelfGraph): a graph with a two-sided max_count schema and contradiction "supersede".

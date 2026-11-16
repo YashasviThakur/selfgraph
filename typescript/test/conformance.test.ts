@@ -8,14 +8,26 @@ import { describe, expect, it } from "vitest";
 
 import { ids, KuzuStore, SelfGraph } from "../src/index.js";
 import type { Schema } from "../src/schema.js";
-import { conformanceStore, dump, SUPERSEDE_SCHEMA, schemaWarnings, supersede, write } from "./conformance/ts_side.js";
+import {
+  conformanceStore,
+  dump,
+  SUPERSEDE_SCHEMA,
+  schemaWarnings,
+  supersede,
+  unmerge,
+  write,
+} from "./conformance/ts_side.js";
 import { reachable, selectedStores, tempKuzu, uniqueNs } from "./helpers.js";
 
 const PY = process.env.SELFGRAPH_PY;
 const SCRIPT = fileURLToPath(new URL("./conformance/py_side.py", import.meta.url));
 const KUZU = tempKuzu("selfgraph-conf-");
 
-function py(cmd: "write" | "dump" | "schema" | "supersede" | "kuzu_isolation", store: string, ns: string): unknown {
+function py(
+  cmd: "write" | "dump" | "schema" | "supersede" | "unmerge" | "kuzu_isolation",
+  store: string,
+  ns: string,
+): unknown {
   const out = execFileSync(PY!, [SCRIPT, cmd, store, ns, KUZU], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
   return JSON.parse(out);
 }
@@ -24,7 +36,7 @@ async function ts<T>(
   store: string,
   ns: string,
   fn: (g: SelfGraph) => Promise<T>,
-  options: { schema?: Schema; contradiction?: "supersede" } = {},
+  options: { schema?: Schema; contradiction?: "supersede"; resolver?: "default" } = {},
 ): Promise<T> {
   const graph = new SelfGraph(conformanceStore(store, KUZU), { namespace: ns, ...options });
   try {
@@ -128,6 +140,18 @@ describe.skipIf(!PY)("cross-language conformance with the Python SDK", () => {
         true,
         false,
       ]);
+    });
+
+    it.skipIf(!live.get(store))(`${store}: unmerging a merge with no source agrees in both languages`, async () => {
+      const nsPy = uniqueNs("conf_um_py");
+      const nsTs = uniqueNs("conf_um_ts");
+      const fromPy = py("unmerge", store, nsPy);
+      const fromTs = await ts(store, nsTs, unmerge, { resolver: "default" });
+      expect(fromTs).toEqual(fromPy);
+      expect(fromTs).toEqual({
+        "person:bob": { source_count: 0, sources: [] },
+        "person:robert": { source_count: 1, sources: ["s2"] },
+      });
     });
 
     it.skipIf(!live.get(store))(

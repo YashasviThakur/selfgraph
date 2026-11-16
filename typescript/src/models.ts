@@ -208,6 +208,7 @@ export interface MergeRewrite {
   rewritten: JsonObject;
   existed: boolean;
   dropped: boolean;
+  prior_sources: string[];
 }
 
 export interface MergeRecord {

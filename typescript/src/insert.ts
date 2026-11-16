@@ -235,7 +235,7 @@ export class Insert {
       let resolution =
         activeResolver === null
           ? null
-          : await planResolution(tx, ns, canonical, activeResolver, activeSchema, createdAt);
+          : await planResolution(tx, ns, canonical, activeResolver, activeSchema, createdAt, source.source_id);
       let resolved = resolution?.facts ?? canonical;
       let dropped: InsertWarning[] = [];
       if (extracted && mode === "strict") {

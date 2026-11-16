@@ -993,6 +993,47 @@ async def write(graph):
     return out
 
 
+async def unmerge(graph):
+    """Unmerge a merge with no source while another merge with a source shares the survivor's relation.
+
+    @param graph (SelfGraph): a graph with the default resolver.
+    @return (dict): each restored relation's source count and evidence sources.
+    """
+
+    def knows(source):
+        return {"from_entity": source, "type": "KNOWS", "to_entity": "person:xena"}
+
+    await graph.insert.facts(
+        {
+            "entities": [
+                {"type": "Person", "name": "Robert", "aliases": ["Bob", "Bobby"]},
+                {"type": "Person", "name": "Xena"},
+            ]
+        }
+    )
+
+    first = await graph.insert.facts(
+        {"entities": [{"type": "Person", "name": "Bob"}], "relations": [knows("person:bob")]}
+    )
+    await graph.insert.facts(
+        {"entities": [{"type": "Person", "name": "Bobby"}], "relations": [knows("person:bobby")]}, source_id="s2"
+    )
+
+    await graph.entities.unmerge(first.merges[0].id)
+
+    out = {}
+    for source in ("person:bob", "person:robert"):
+        rid = ids.relation_id(source, "KNOWS", "person:xena")
+        rel = await graph.relations.get(rid)
+        evidence = await graph.relations.evidence(rid)
+        out[source] = {
+            "source_count": rel.source_count if rel else None,
+            "sources": sorted(e.source_id for e in evidence.items),
+        }
+
+    return out
+
+
 async def supersede(graph):
     """Supersede relations capped at both endpoints, with facts arriving out of order across batches.
 
@@ -1338,11 +1379,15 @@ async def main():
     store_name, ns = sys.argv[2], sys.argv[3]
     kuzu_path = sys.argv[4] if len(sys.argv) > 4 else None
     options = {"schema": SUPERSEDE_SCHEMA, "contradiction": "supersede"} if cmd == "supersede" else {}
+    if cmd == "unmerge":
+        options = {"resolver": "default"}
     graph = SelfGraph(store=STORES[store_name](kuzu_path), namespace=ns, **options)
     try:
         await graph.initialize()
         if cmd == "supersede":
             result = await supersede(graph)
+        elif cmd == "unmerge":
+            result = await unmerge(graph)
         else:
             result = await write(graph) if cmd == "write" else await dump(graph, ns)
     finally:

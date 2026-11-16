@@ -722,6 +722,7 @@ function redirect(ent: ParsedEntityInput, target: Entity): ParsedEntityInput {
  * @param resolver (EntityResolver): the resolver.
  * @param schema (ParsedSchema | null): the active schema, for parent-closure type compatibility.
  * @param createdAt (Date): the insert time.
+ * @param sourceId (string | null): the inserted source, if any.
  * @return (Resolution): the rewritten facts, the merges it carries, and merge_self_loop warnings.
  */
 export async function planResolution(
@@ -731,6 +732,7 @@ export async function planResolution(
   resolver: EntityResolver,
   schema: ParsedSchema | null,
   createdAt: Date,
+  sourceId: string | null = null,
 ): Promise<Resolution> {
   const keyed = facts.entities.map((ent) => {
     const etype = ops.cleanText(ent.type);
@@ -861,8 +863,52 @@ export async function planResolution(
   }
   if (!mapping.size) return { facts, merges: [], warnings: [] };
   const warnings: InsertWarning[] = [];
-  const rewritten = await rewriteRefs(runner, ns, facts, mapping, merges, warnings);
+  const rewritten = await rewriteRefs(runner, ns, facts, mapping, merges, warnings, sourceId);
   return { facts: { ...rewritten, entities }, merges: [...merges.values()], warnings };
+}
+
+async function evidenceOf(runner: Runner, ns: string, relationId: string): Promise<Evidence[]> {
+  return ops.scan((skip, limit) => ops.listEvidence(runner, ns, relationId, "relation", skip, limit));
+}
+
+/**
+ * Tell whether something other than a merge's own decisions uses a relation, so it was stated after the merge. A relation stated again from the merge's source adds no evidence, so a decision step is the only trace of it.
+ *
+ * @param runner (Runner): the graph runner.
+ * @param ns (string): the namespace.
+ * @param relationId (string): the relation the merge rewrote onto.
+ * @param ownTraces (Set<string>): the decision traces the merge rewrote.
+ * @return (Promise<boolean>): whether another decision uses the relation.
+ */
+async function statedSince(runner: Runner, ns: string, relationId: string, ownTraces: Set<string>): Promise<boolean> {
+  return [...(await ops.tracesTouchingRelations(runner, ns, [relationId]))].some((t) => !ownTraces.has(t));
+}
+
+/**
+ * Take a merge's sources off a relation that stays on the survivor, and recount the distinct sources left.
+ *
+ * @param runner (Runner): the graph runner.
+ * @param ns (string): the namespace.
+ * @param relationId (string): the relation the merge rewrote onto.
+ * @param own (string[]): the sources the merge was seen in.
+ * @param keep (Set<string>): sources that stay because another live merge or a direct statement still backs them.
+ * @return (Promise<Evidence[]>): the evidence of the merge's sources, to carry onto the restored relation.
+ */
+async function stripMergeEvidence(
+  runner: Runner,
+  ns: string,
+  relationId: string,
+  own: string[],
+  keep: Set<string>,
+): Promise<Evidence[]> {
+  const on = await evidenceOf(runner, ns, relationId);
+  const strip = own.filter((sourceId) => !keep.has(sourceId));
+  for (const sourceId of strip) {
+    await runner.deleteNodesBy(ns, L_EVIDENCE, { target_id: relationId, source_id: sourceId });
+  }
+  const left = new Set(on.filter((e) => !strip.includes(e.source_id)).map((e) => e.source_id));
+  await runner.updateCurrentEdge(ns, relationId, { source_count: left.size });
+  return on.filter((e) => own.includes(e.source_id));
 }
 
 /**
@@ -902,6 +948,7 @@ export function trimResolution(resolution: Resolution, kept: ParsedExtraction): 
  * @param mapping (Map<string, string>): candidate id to target id.
  * @param merges (Map<string, PendingMerge>): the merges by candidate id.
  * @param warnings (InsertWarning[]): receives one merge_self_loop warning per dropped relation.
+ * @param sourceId (string | null): the inserted source, which backs a relation this insert also states directly.
  * @return (ParsedExtraction): the facts with rewritten relations, preferences, and decisions.
  */
 async function rewriteRefs(
@@ -911,6 +958,7 @@ async function rewriteRefs(
   mapping: Map<string, string>,
   merges: Map<string, PendingMerge>,
   warnings: InsertWarning[],
+  sourceId: string | null,
 ): Promise<ParsedExtraction> {
   const m = <T extends string | null>(eid: T): T => (eid === null ? eid : ((mapping.get(eid) ?? eid) as T));
   const note = (rewrite: MergeRewrite, refs: Set<string>): void => {
@@ -932,9 +980,18 @@ async function rewriteRefs(
     const newId = ridOf(next);
     const refs = new Set([rel.from_entity, rel.to_entity]);
     relRefs.set(oldId, refs);
-    const existed = keptRids.has(newId) || (await ops.relationExists(runner, ns, newId));
+    const stored = await ops.relationExists(runner, ns, newId);
+    const existed = keptRids.has(newId) || stored;
+    const backing = new Set(stored ? (await evidenceOf(runner, ns, newId)).map((e) => e.source_id) : []);
+    if (keptRids.has(newId) && sourceId !== null) backing.add(sourceId);
     const loop = next.from_entity === next.to_entity && rel.from_entity !== rel.to_entity;
-    const rewrite = { original: dumpRelation(rel), rewritten: dumpRelation(next), existed, dropped: loop };
+    const rewrite = {
+      original: dumpRelation(rel),
+      rewritten: dumpRelation(next),
+      existed,
+      dropped: loop,
+      prior_sources: [...backing].sort(comparePy),
+    };
     note({ kind: "relation", id: newId, ...rewrite }, refs);
     if (loop) {
       dropped.add(oldId);
@@ -974,6 +1031,7 @@ async function rewriteRefs(
         rewritten: dumpPreference(next),
         existed,
         dropped: false,
+        prior_sources: [],
       },
       refs,
     );
@@ -1007,6 +1065,7 @@ async function rewriteRefs(
         rewritten: dumpDecision(next),
         existed,
         dropped: false,
+        prior_sources: [],
       },
       refs,
     );
@@ -1273,11 +1332,24 @@ type Moved = Array<[MergeRewrite, MergeRewrite]>;
  * @param rw (MergeRewrite): a rewrite of a still-live merge.
  * @param moved (Moved): each rewrite the unmerge replayed, with its new location.
  * @param restored (Map<string, string>): the relation ids the unmerge moved, old to new.
+ * @param handed (Set<string>): JSON `[kind, id]` of each object the unmerged merge created and left to the others.
+ * @param added (Map<string, Set<string>>): JSON `[kind, id]` of each shared relation, with the sources the unmerged merge added to it.
  * @return (MergeRewrite): the rewrite to keep on that merge.
  */
-function forward(rw: MergeRewrite, moved: Moved, restored: Map<string, string>): MergeRewrite {
+function forward(
+  rw: MergeRewrite,
+  moved: Moved,
+  restored: Map<string, string>,
+  handed: Set<string>,
+  added: Map<string, Set<string>>,
+): MergeRewrite {
   for (const [old, next] of moved) {
     if (rw.kind === old.kind && rw.id === old.id && deepEqual(rw.original, old.original)) return next;
+  }
+  if (rw.existed && handed.has(JSON.stringify([rw.kind, rw.id]))) return { ...rw, existed: false, prior_sources: [] };
+  const gone = added.get(JSON.stringify([rw.kind, rw.id]));
+  if (gone && rw.prior_sources.some((s) => gone.has(s))) {
+    return { ...rw, prior_sources: rw.prior_sources.filter((s) => !gone.has(s)) };
   }
   const steps = rw.rewritten.steps;
   if (rw.kind === "decision" && Array.isArray(steps) && steps.some((s) => restored.has(s as string))) {
@@ -1287,13 +1359,15 @@ function forward(rw: MergeRewrite, moved: Moved, restored: Map<string, string>):
 }
 
 /**
- * Update the live merges that share a rewrite with an unmerged one, so unmerging them later replays exactly. Merges from one insert can rewrite the same relation, preference, or decision (both endpoints merged, say); once one is unmerged that object lives somewhere new, so the other merges record that location, whether it existed before, and the restored entity id, and undo from there.
+ * Update the live merges that share a rewrite with an unmerged one, so unmerging them later replays exactly. Merges from one insert can rewrite the same relation, preference, or decision (both endpoints merged, say); once one is unmerged that object lives somewhere new, so the other merges record that location, whether it existed before, and the restored entity id, and undo from there. An object the unmerged merge created and a later merge only found there is now the later merge's to undo, so its rewrite stops saying it already existed.
  *
  * @param runner (Runner): the graph runner.
  * @param ns (string): the namespace.
  * @param mergeId (string): the merge being reverted.
  * @param moved (Moved): each rewrite the unmerge replayed, with its new location.
  * @param restored (Map<string, string>): the relation ids the unmerge moved, old to new.
+ * @param handed (Set<string>): JSON `[kind, id]` of each object the unmerged merge created and left to the others.
+ * @param added (Map<string, Set<string>>): JSON `[kind, id]` of each shared relation, with the sources the unmerged merge added to it.
  */
 async function forwardSiblings(
   runner: Runner,
@@ -1301,6 +1375,8 @@ async function forwardSiblings(
   mergeId: string,
   moved: Moved,
   restored: Map<string, string>,
+  handed: Set<string>,
+  added: Map<string, Set<string>>,
   liveMerges?: Props[] | null,
   liveEntries?: Map<string, Props[]> | null,
 ): Promise<void> {
@@ -1309,11 +1385,37 @@ async function forwardSiblings(
   for (const props of live) {
     const own = entries.get(props.id as string) ?? [];
     const sib = decodeMerge(props, own);
-    const rewrites = sib.rewrites.map((rw) => forward(rw, moved, restored));
+    const rewrites = sib.rewrites.map((rw) => forward(rw, moved, restored, handed, added));
     if (rewrites.every((rw, i) => rw === sib.rewrites[i])) continue;
     await runner.lockNode(ns, L_MERGE, sib.id);
     await writeMerges(runner, ns, [{ ...sib, rewrites }], entries);
   }
+}
+
+/**
+ * List the objects that a live merge other than this one also rewrote onto, with the sources those merges hold.
+ *
+ * @param runner (Runner): the graph runner.
+ * @param ns (string): the namespace.
+ * @param mergeId (string): the merge being reverted.
+ * @return (Map<string, Set<string>>): JSON.stringify([kind, id]) of each relation, preference, or decision a sibling still points at,
+ *   mapped to the source ids of the siblings that point at it.
+ */
+async function sharedRewrites(runner: Runner, ns: string, mergeId: string): Promise<Map<string, Set<string>>> {
+  const live = (await scanLiveMerges(runner, ns)).filter((props) => props.id !== mergeId);
+  const entries = await loadEntries(runner, ns, live);
+  const out = new Map<string, Set<string>>();
+  for (const props of live) {
+    const sibling = decodeMerge(props, entries.get(props.id as string) ?? []);
+    for (const rw of sibling.rewrites) {
+      if (rw.dropped) continue;
+      const key = JSON.stringify([rw.kind, rw.id]);
+      const held = out.get(key) ?? new Set<string>();
+      for (const sourceId of sibling.source_ids) held.add(sourceId);
+      out.set(key, held);
+    }
+  }
+  return out;
 }
 
 /**
@@ -1373,10 +1475,12 @@ export async function unmerge(runner: Runner, ns: string, mergeId: string): Prom
     return (await exists(original)) ? original : rewritten;
   };
 
+  const shared = await sharedRewrites(runner, ns, rec.id);
   const restored = new Map<string, string>();
   const origRestored = new Map<string, string>();
   const moved: Moved = [];
   const relations: Relation[] = [];
+  const ownTraces = new Set(rec.rewrites.filter((r) => r.kind === "decision").map((r) => r.id));
   for (const rw of rec.rewrites.filter((r) => r.kind === "relation")) {
     const original = parseOrThrow(RelationInput, rw.original, "relation");
     const rewritten = parseOrThrow(RelationInput, rw.rewritten, "relation");
@@ -1392,10 +1496,21 @@ export async function unmerge(runner: Runner, ns: string, mergeId: string): Prom
     if (latest !== undefined) {
       properties = latest.properties;
       eventTime = latest.event_time;
-      carried = await ops.scan((skip, limit) => ops.listEvidence(runner, ns, rw.id, "relation", skip, limit));
-      touching = await ops.tracesTouchingRelations(runner, ns, [rw.id]);
-      await runner.deleteEdges(ns, rw.id);
-      await ops.deleteEvidence(runner, ns, rw.id);
+      const on = await evidenceOf(runner, ns, rw.id);
+      let held = shared.get(JSON.stringify(["relation", rw.id]));
+      if (await statedSince(runner, ns, rw.id, ownTraces)) held = new Set([...(held ?? []), ...rec.source_ids]);
+      if (held !== undefined || on.some((e) => !rec.source_ids.includes(e.source_id))) {
+        carried = await stripMergeEvidence(runner, ns, rw.id, rec.source_ids, held ?? new Set());
+      } else {
+        carried = on;
+        touching = await ops.tracesTouchingRelations(runner, ns, [rw.id]);
+        await runner.deleteEdges(ns, rw.id);
+        await ops.deleteEvidence(runner, ns, rw.id);
+      }
+    } else if (rw.existed && !rw.dropped && (await ops.relationExists(runner, ns, rw.id))) {
+      const keep = new Set([...(shared.get(JSON.stringify(["relation", rw.id])) ?? []), ...rw.prior_sources]);
+      if (await statedSince(runner, ns, rw.id, ownTraces)) for (const s of rec.source_ids) keep.add(s);
+      carried = await stripMergeEvidence(runner, ns, rw.id, rec.source_ids, keep);
     }
     const back: ParsedRelationInput = {
       ...original,
@@ -1429,7 +1544,7 @@ export async function unmerge(runner: Runner, ns: string, mergeId: string): Prom
     if (!((await exists(subject)) && (await exists(value)))) continue;
     const current = await ops.getPreference(runner, ns, rw.id);
     const kept = current !== null && !rw.existed ? current : original;
-    if (kept === current) await runner.deleteEdges(ns, rw.id);
+    if (kept === current && !shared.has(JSON.stringify(["preference", rw.id]))) await runner.deleteEdges(ns, rw.id);
     const back: ParsedPreferenceInput = {
       ...original,
       subject_entity: subject,
@@ -1483,7 +1598,8 @@ export async function unmerge(runner: Runner, ns: string, mergeId: string): Prom
     if (!stepsExist) continue;
     const current = await ops.getTrace(runner, ns, rw.id);
     const kept = current !== null && !rw.existed ? current : original;
-    if (kept === current) await ops.deleteTraceQuietly(runner, ns, rw.id);
+    if (kept === current && !shared.has(JSON.stringify(["decision", rw.id])))
+      await ops.deleteTraceQuietly(runner, ns, rw.id);
     const alternatives: string[] = [];
     for (const [i, o] of original.alternative_entities.entries()) {
       const alternative = await end(o, rewritten.alternative_entities[i]!);
@@ -1532,7 +1648,22 @@ export async function unmerge(runner: Runner, ns: string, mergeId: string): Prom
     moved.push([rw, { ...rw, id: trace.id, rewritten: dumpDecision(back), existed, dropped: false }]);
   }
 
-  if (moved.length) await forwardSiblings(runner, ns, rec.id, moved, restored, liveMerges, liveEntries);
+  if (moved.length) {
+    const handed = new Set(
+      rec.rewrites
+        .filter((rw) => !(rw.existed || rw.dropped) && shared.has(JSON.stringify([rw.kind, rw.id])))
+        .map((rw) => JSON.stringify([rw.kind, rw.id])),
+    );
+    const added = new Map(
+      rec.rewrites
+        .filter((rw) => rw.kind === "relation" && !rw.dropped && shared.has(JSON.stringify([rw.kind, rw.id])))
+        .map((rw) => [
+          JSON.stringify([rw.kind, rw.id]),
+          new Set(rec.source_ids.filter((s) => !rw.prior_sources.includes(s))),
+        ]),
+    );
+    await forwardSiblings(runner, ns, rec.id, moved, restored, handed, added, liveMerges, liveEntries);
+  }
   const survivor = (await exists(rec.survivor_id))
     ? await ops.updateEntity(
         runner,

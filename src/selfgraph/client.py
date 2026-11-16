@@ -607,7 +607,9 @@ class SelfGraph:
             canonical = await _ops.validate_facts(tx, ns, facts, rewrite=lambda o: canonicalize_types(o, active_schema))
             resolution = None
             if active_resolver is not None:
-                resolution = await plan_resolution(tx, ns, canonical, active_resolver, active_schema, created_at)
+                resolution = await plan_resolution(
+                    tx, ns, canonical, active_resolver, active_schema, created_at, source_id=source_id
+                )
             resolved = resolution.facts if resolution is not None else canonical
             dropped: list[InsertWarning] = []
             if extracted and mode == "strict":

@@ -954,11 +954,18 @@ def chunk_cases():
     )
     by_chars = [c.__dict__ for c in chunking._chunk_by_chars(long_text, size=200, overlap=40)]
     by_tokens = [c.__dict__ for c in chunking.chunk_text(long_text, max_tokens=64, overlap_tokens=8)]
+    split_text = "भारत एक विशाल देश है। दिल्ली इसकी राजधानी है। 日本語のテキスト 🚀🚀 " * 12
+    special_text = "GPT-2 separates samples with <|endoftext|> and <|fim_prefix|> markers. " * 6
     return {
         "text": long_text,
         "by_chars": by_chars,
         "by_tokens": by_tokens,
         "count_tokens": [chunking.count_tokens(t) for t in TEXTS],
+        "split_text": split_text,
+        "split_by_tokens": [c.__dict__ for c in chunking.chunk_text(split_text, max_tokens=25, overlap_tokens=5)],
+        "special_text": special_text,
+        "special_by_tokens": [c.__dict__ for c in chunking.chunk_text(special_text, max_tokens=20, overlap_tokens=4)],
+        "special_count": chunking.count_tokens(special_text),
     }
 
 

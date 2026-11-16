@@ -9,7 +9,7 @@ from selfgraph import EntityInput, LLMConfig, ValidationError
 from selfgraph._ops import _require_text
 from selfgraph.errors import error_reason, surface_hint
 from selfgraph.extraction import chunking
-from selfgraph.extraction.chunking import _chunk_by_chars, chunk_text
+from selfgraph.extraction.chunking import _chunk_by_chars, chunk_text, count_tokens
 from selfgraph.extraction.extractor import LLMExtractor, _EntitiesOut
 from selfgraph.llm.base import _fatal, _require_provider, _sends_temperature, resolve_llm, summarize_error
 from selfgraph.models import ParsedDocument
@@ -132,6 +132,23 @@ def test_empty_and_wrongly_typed_text_have_distinct_messages():
         _require_text("namespace", "  ")
     with pytest.raises(ValidationError, match="^namespace must be a string, got int$"):
         _require_text("namespace", 5)
+
+
+def test_chunk_text_never_cuts_inside_a_character_and_offsets_point_at_the_text():
+    pytest.importorskip("tiktoken")
+    for text in ("भारत एक विशाल देश है। दिल्ली इसकी राजधानी है। " * 20, "日本語のテキスト 🚀🚀 " * 30):
+        chunks = chunk_text(text, max_tokens=12, overlap_tokens=3)
+        assert len(chunks) > 1
+        for chunk in chunks:
+            assert "�" not in chunk.text
+            assert text[chunk.start_offset : chunk.end_offset] == chunk.text
+
+
+def test_special_token_text_is_plain_text_for_chunks_and_counts():
+    pytest.importorskip("tiktoken")
+    text = "GPT-2 separates samples with <|endoftext|>."
+    assert count_tokens(text) > 5
+    assert "".join(c.text for c in chunk_text(text)) == text
 
 
 def test_chunk_text_validates_sizes_defaults_the_overlap_and_splits_on_word_boundaries():

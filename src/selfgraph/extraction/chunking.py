@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 from .._ops import _require_int
 from ..errors import ValidationError, error_reason
@@ -48,7 +49,7 @@ def count_tokens(text: str) -> int:
     enc = _encoder()
     if enc is None:
         return max(1, len(text) // 4)
-    return len(enc.encode(text))
+    return len(enc.encode(text, disallowed_special=()))
 
 
 @dataclass(frozen=True)
@@ -94,22 +95,49 @@ def chunk_text(text: str, *, max_tokens: int = 512, overlap_tokens: int | None =
     if enc is None:
         return _chunk_by_chars(text, size=max_tokens * 4, overlap=overlap_tokens * 4)
 
-    tokens = enc.encode(text)
+    tokens = enc.encode(text, disallowed_special=())
+    edges = _char_edges(enc, tokens, len(text))
     step = max_tokens - overlap_tokens
     chunks: list[Chunk] = []
     index = 0
     i = 0
     n = len(tokens)
     while i < n:
-        piece = enc.decode(tokens[i : i + max_tokens])
-        start = len(enc.decode(tokens[:i]))
+        start, end = edges[i], edges[min(i + max_tokens, n)]
+        piece = text[start:end]
         if piece.strip():
-            chunks.append(Chunk(index=index, text=piece, start_offset=start, end_offset=start + len(piece)))
+            chunks.append(Chunk(index=index, text=piece, start_offset=start, end_offset=end))
             index += 1
         if i + max_tokens >= n:
             break
         i += step
     return chunks
+
+
+def _char_edges(enc: Any, tokens: list[int], length: int) -> list[int]:
+    """Map each token boundary to a character offset, moving a boundary inside a character back to its start.
+
+    The encoding is byte-level, so one character can span several tokens. A run of tokens is complete once its
+    decoded text no longer ends with U+FFFD, which needs only encode and decode and costs linear time.
+
+    @param enc (Any): the tiktoken encoder.
+    @param tokens (list[int]): the encoded text.
+    @param length (int): the text length in characters, the offset of the last boundary.
+    @return (list[int]): len(tokens) + 1 offsets; edges[i] is where token i starts.
+    """
+    edges = [0] * (len(tokens) + 1)
+    done = 0
+    pending = 0
+    for i in range(len(tokens)):
+        piece = enc.decode(tokens[pending : i + 1])
+        if piece.endswith("�"):
+            edges[i + 1] = done
+            continue
+        done += len(piece)
+        edges[i + 1] = done
+        pending = i + 1
+    edges[-1] = length
+    return edges
 
 
 def _chunk_by_chars(text: str, *, size: int, overlap: int) -> list[Chunk]:

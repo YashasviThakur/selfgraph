@@ -152,6 +152,11 @@ describe("extraction, chunking, and retrieval helpers match Python", () => {
     );
     expect(chunkText(fx.chunks.text, { max_tokens: 1 }).length).toBeGreaterThan(0);
     expect(fx.extract.map((c: { text: string }) => countTokens(c.text))).toEqual(fx.chunks.count_tokens);
+    expect(chunkText(fx.chunks.split_text, { max_tokens: 25, overlap_tokens: 5 })).toEqual(fx.chunks.split_by_tokens);
+    expect(chunkText(fx.chunks.special_text, { max_tokens: 20, overlap_tokens: 4 })).toEqual(
+      fx.chunks.special_by_tokens,
+    );
+    expect(countTokens(fx.chunks.special_text)).toBe(fx.chunks.special_count);
   });
 
   it("the LLM-free regex extractor assembles the same facts", async () => {

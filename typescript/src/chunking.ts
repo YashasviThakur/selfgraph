@@ -107,20 +107,49 @@ export function chunkText(text: string, options: { max_tokens?: number; overlap_
   if (!encoder) return chunkByChars(text, maxTokens * CHARS_PER_TOKEN, overlapTokens * CHARS_PER_TOKEN);
 
   const tokens = encode(encoder, text);
+  const cps = Array.from(text);
+  const edges = charEdges(encoder, tokens, cps.length);
   const step = maxTokens - overlapTokens;
   const chunks: Chunk[] = [];
   let index = 0;
   const n = tokens.length;
   for (let i = 0; i < n; i += step) {
-    const piece = encoder.decode(tokens.slice(i, i + maxTokens));
-    const start = cpLen(encoder.decode(tokens.slice(0, i)));
+    const start = edges[i]!;
+    const end = edges[Math.min(i + maxTokens, n)]!;
+    const piece = cps.slice(start, end).join("");
     if (pyStrip(piece)) {
-      chunks.push({ index, text: piece, start_offset: start, end_offset: start + cpLen(piece) });
+      chunks.push({ index, text: piece, start_offset: start, end_offset: end });
       index++;
     }
     if (i + maxTokens >= n) break;
   }
   return chunks;
+}
+
+/**
+ * Map each token boundary to a code point offset, moving a boundary inside a character back to its start. The encoding is byte-level, so one character can span several tokens; a run of tokens is complete once its decoded text no longer ends with U+FFFD, which needs only encode and decode and costs linear time.
+ *
+ * @param enc (Encoder): the tokenizer.
+ * @param tokens (number[]): the encoded text.
+ * @param length (number): the text length in code points, the offset of the last boundary.
+ * @return (number[]): tokens.length + 1 offsets; edges[i] is where token i starts.
+ */
+function charEdges(enc: Encoder, tokens: number[], length: number): number[] {
+  const edges = new Array<number>(tokens.length + 1).fill(0);
+  let done = 0;
+  let pending = 0;
+  for (let i = 0; i < tokens.length; i++) {
+    const piece = enc.decode(tokens.slice(pending, i + 1));
+    if (piece.endsWith("�")) {
+      edges[i + 1] = done;
+      continue;
+    }
+    done += cpLen(piece);
+    edges[i + 1] = done;
+    pending = i + 1;
+  }
+  edges[tokens.length] = length;
+  return edges;
 }
 
 /**
